@@ -63,6 +63,11 @@ fi
 command -v clang >/dev/null || winget_install LLVM.LLVM
 command -v cmake >/dev/null || winget_install Kitware.CMake
 command -v ninja >/dev/null || winget_install Ninja-build.Ninja
+# winget's portable packages (Ninja) land under WinGet/Packages, reached through
+# links this shell may not follow: add their folders too.
+for exe in "$(cygpath -u "$LOCALAPPDATA")"/Microsoft/WinGet/Packages/*/ninja.exe; do
+    [ -f "$exe" ] && export PATH="$PATH:$(dirname "$exe")"
+done
 for tool in clang clang++ cmake ninja git; do
     command -v "$tool" >/dev/null || fail "$tool is still not found - close Git Bash, open it again and rerun this"
 done
