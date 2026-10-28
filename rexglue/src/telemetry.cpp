@@ -8,9 +8,9 @@
 // player car's physics object has not been found in this build yet. What is
 // known is the race's camera: CGtViewport::Update makes its view window in
 // sub_82353BA8 (widescreen.cpp) and sets it with RwCameraSetViewWindow
-// (sub_8234ABC0, r3 the RwCamera) every frame. A RenderWare camera is an
-// RwObjectHasFrame, so its frame is at +4, and the frame's world matrix (its
-// LTM) at +80: right, up, at and pos, each a vector of three floats and a pad.
+// (sub_8234ABC0) every frame; r3 there leads to the RwCamera (FindFrame). A
+// RenderWare camera is an RwObjectHasFrame, so its frame is at +4, and the
+// frame's world matrix (its LTM) at +80: right, up, at and pos, each a vector of three floats and a pad.
 // Burnout's chase and bumper cameras are carried by the car, a little behind
 // and lagging it, so the camera's path is the car's path:
 //   - position: the camera's (the motion software differentiates it twice
@@ -72,6 +72,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -80,6 +81,8 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 #include "guest_memory.h"
 #include "xerenge_settings.h"
 
@@ -266,7 +269,6 @@ double g_pitch = 0;
 Clock::time_point g_last_race{};
 Clock::time_point g_last_idle{};
 bool g_told_camera = false;
-bool g_told_reject = false;
 
 double Seconds() {
   static const auto start = Clock::now();
@@ -357,35 +359,179 @@ void LearnUp(Vec3 camera_up) {
   REXLOG_INFO("telemetry: the world's up is {}{}", g_up_sign < 0 ? "-" : "+", "xyz"[axis]);
 }
 
+// Whether the title can read [address, address + bytes). The camera is looked
+// for by following what might be pointers, and one that lands on an unmapped
+// page would take the process down.
+bool Readable(uint32_t address, uint32_t bytes) {
+  if (address < 0x10000000u || bytes == 0) {
+    return false;
+  }
+  const uint32_t last = address + bytes - 1;
+  if (last < address) {
+    return false;
+  }
+  auto* kernel_state = REX_KERNEL_STATE();
+  auto* memory = kernel_state ? kernel_state->memory() : nullptr;
+  if (!memory) {
+    return false;
+  }
+  auto* heap = memory->LookupHeap(address);
+  if (!heap || memory->LookupHeap(last) != heap) {
+    return false;
+  }
+  return heap->QueryRangeAccess(address, last) != rex::memory::PageAccess::kNoAccess;
+}
+
+double AbsDot(Vec3 a, Vec3 b) { return std::fabs(Dot(a, b)); }
+
+// An RwFrame (RwObject type 0) whose world matrix (LTM, +80: right, up, at,
+// pos) is a rotation and a sane position.
+bool UsableFrame(const uint8_t* base, uint32_t frame) {
+  if (!Readable(frame, 144) || *xerenge::GuestPointer(base, frame) != 0) {
+    return false;
+  }
+  const Vec3 right = GuestVec(base, frame + 80);
+  const Vec3 up = GuestVec(base, frame + 96);
+  const Vec3 at = GuestVec(base, frame + 112);
+  const Vec3 pos = GuestVec(base, frame + 128);
+  return Unit(right) && Unit(up) && Unit(at) && AbsDot(right, up) < 0.1 &&
+         AbsDot(right, at) < 0.1 && AbsDot(up, at) < 0.1 && std::isfinite(Length(pos)) &&
+         Length(pos) < 1.0e6;
+}
+
+// An RwCamera (RwObject type 4, its frame at +4) with a usable frame: the
+// frame, or 0.
+uint32_t CameraFrame(const uint8_t* base, uint32_t camera) {
+  if (!Readable(camera, 8) || *xerenge::GuestPointer(base, camera) != 4) {
+    return 0;
+  }
+  const uint32_t frame = xerenge::LoadGuestU32(base, camera + 4);
+  return UsableFrame(base, frame) ? frame : 0;
+}
+
+// What sub_8234ABC0 gets in r3 is not always the RwCamera itself: on the
+// retail 360 build it is an object of the title's own whose first word is a
+// vtable (the log's "type 130" is that pointer's top byte, 0x82). So the
+// camera is looked for: r3 itself, else an RwCamera that a pointer in r3's
+// first 512 bytes leads to, else an RwFrame one leads to directly. The way
+// found is kept and checked each frame; if it stops working it is looked for
+// again, twice a second at most.
+enum class Via { kUnknown, kItself, kCameraAt, kFrameAt };
+Via g_via = Via::kUnknown;
+uint32_t g_via_offset = 0;
+double g_last_search = -1.0;
+double g_last_reject_log = -100.0;
+uint32_t g_rejects = 0;
+bool g_dumped = false;
+constexpr uint32_t kScanBytes = 0x200;
+
+uint32_t Resolve(const uint8_t* base, uint32_t object, Via via, uint32_t offset) {
+  switch (via) {
+    case Via::kItself:
+      return CameraFrame(base, object);
+    case Via::kCameraAt:
+    case Via::kFrameAt: {
+      if (!Readable(object + offset, 4)) {
+        return 0;
+      }
+      const uint32_t p = xerenge::LoadGuestU32(base, object + offset);
+      if (p < 0x10000000u) {
+        return 0;
+      }
+      if (via == Via::kCameraAt) {
+        return CameraFrame(base, p);
+      }
+      return UsableFrame(base, p) ? p : 0;
+    }
+    default:
+      return 0;
+  }
+}
+
+const char* ViaName(Via via) {
+  switch (via) {
+    case Via::kItself:
+      return "itself the RwCamera";
+    case Via::kCameraAt:
+      return "points to the RwCamera";
+    case Via::kFrameAt:
+      return "points to the camera's RwFrame";
+    default:
+      return "?";
+  }
+}
+
+uint32_t FindFrame(const uint8_t* base, uint32_t object) {
+  if (g_via != Via::kUnknown) {
+    if (const uint32_t frame = Resolve(base, object, g_via, g_via_offset)) {
+      return frame;
+    }
+  }
+  const double now = Seconds();
+  if (g_last_search >= 0.0 && now - g_last_search < 0.5) {
+    return 0;
+  }
+  g_last_search = now;
+
+  auto found = [&](Via via, uint32_t offset, uint32_t frame) {
+    if (via != g_via || offset != g_via_offset) {
+      REXLOG_INFO("telemetry: camera found - {:08X}{}{:X} {} (frame {:08X})", object,
+                  via == Via::kItself ? "" : " +0x", via == Via::kItself ? 0u : offset,
+                  ViaName(via), frame);
+    }
+    g_via = via;
+    g_via_offset = offset;
+    return frame;
+  };
+
+  if (const uint32_t frame = Resolve(base, object, Via::kItself, 0)) {
+    return found(Via::kItself, 0, frame);
+  }
+  uint32_t scan = kScanBytes;
+  while (scan > 16 && !Readable(object, scan)) {
+    scan /= 2;
+  }
+  if (Readable(object, scan)) {
+    for (const Via via : {Via::kCameraAt, Via::kFrameAt}) {
+      for (uint32_t offset = 0; offset < scan; offset += 4) {
+        if (const uint32_t frame = Resolve(base, object, via, offset)) {
+          return found(via, offset, frame);
+        }
+      }
+    }
+  }
+
+  ++g_rejects;
+  if (!g_dumped && Readable(object, 64)) {
+    g_dumped = true;
+    std::string words;
+    for (uint32_t i = 0; i < 16; ++i) {
+      char text[12];
+      std::snprintf(text, sizeof(text), "%s%08X", i ? " " : "",
+                    xerenge::LoadGuestU32(base, object + i * 4));
+      words += text;
+    }
+    REXLOG_WARN("telemetry: no camera found from {:08X} (scanned {} bytes); its first words: {}",
+                object, scan, words);
+  }
+  if (now - g_last_reject_log >= 10.0) {
+    g_last_reject_log = now;
+    REXLOG_WARN("telemetry: still no race camera ({} tries); nothing is sent", g_rejects);
+  }
+  return 0;
+}
+
 // The race camera's matrix this frame, made into a car-like transform.
 void RaceCamera(const uint8_t* base, uint32_t camera) {
   const Config& c = Settings();
-  // RwObject: type (rwCAMERA, 4), subType, flags, privateFlags, then the frame.
-  const uint8_t type = *xerenge::GuestPointer(base, camera);
-  const uint32_t frame = xerenge::LoadGuestU32(base, camera + 4);
-  if (type != 4 || frame < 0x10000u || frame >= 0xFFFF0000u || *xerenge::GuestPointer(base, frame) != 0) {
-    if (!g_told_reject) {
-      g_told_reject = true;
-      REXLOG_WARN("telemetry: camera {:08X} does not look like an RwCamera (type {}, frame {:08X}); "
-                  "nothing is sent",
-                  camera, int(type), frame);
-    }
+  const uint32_t frame = FindFrame(base, camera);
+  if (frame == 0) {
     return;
   }
-  // The frame's LTM: right +80, up +96, at +112, pos +128.
-  const Vec3 right = GuestVec(base, frame + 80);
+  // The frame's LTM: up +96, at +112, pos +128 (right, +80, is not needed).
   const Vec3 cam_up = GuestVec(base, frame + 96);
   const Vec3 at = GuestVec(base, frame + 112);
   const Vec3 pos = GuestVec(base, frame + 128);
-  if (!Unit(right) || !Unit(cam_up) || !Unit(at) || !std::isfinite(Length(pos)) ||
-      Length(pos) > 1.0e6) {
-    if (!g_told_reject) {
-      g_told_reject = true;
-      REXLOG_WARN("telemetry: camera {:08X}'s frame {:08X} has no usable matrix; nothing is sent",
-                  camera, frame);
-    }
-    return;
-  }
   if (!g_told_camera) {
     g_told_camera = true;
     REXLOG_INFO("telemetry: race camera {:08X}, frame {:08X}, viewport {:08X}", camera, frame,
