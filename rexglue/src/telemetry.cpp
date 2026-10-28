@@ -541,6 +541,23 @@ uint32_t LearnMatrix(const uint8_t* base, uint32_t camera, uint32_t viewport) {
 }
 
 uint32_t FindMatrix(const uint8_t* base, uint32_t camera, uint32_t viewport) {
+  // The camera's first word points to its world matrix (82D144B0 in a race on
+  // the retail disc: learned once, 975 frames along its view against 330 for
+  // the start's fly-by, and the same as the heap copy the search settled on).
+  // Taken straight away, so the motion starts with the race rather than after
+  // a minute of learning; the search is left for a build where it is not so.
+  if (Readable(camera, 4)) {
+    const uint32_t first = xerenge::LoadGuestU32(base, camera);
+    if (Readable(first, 64) && WorldMatrix(base, first)) {
+      static bool told = false;
+      if (!told) {
+        told = true;
+        REXLOG_INFO("telemetry: camera matrix at {:08X}, from camera {:08X}'s first word", first,
+                    camera);
+      }
+      return first;
+    }
+  }
   if (g_matrix != 0) {
     if (Readable(g_matrix, 64) && WorldMatrix(base, g_matrix)) {
       return g_matrix;
