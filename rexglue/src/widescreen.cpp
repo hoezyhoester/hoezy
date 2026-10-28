@@ -31,6 +31,7 @@
 #include <rex/logging.h>
 #include <rex/ppc.h>
 #include "guest_memory.h"
+#include "telemetry.h"
 #include "widescreen.h"
 
 extern "C" void __imp__sub_82353BA8(PPCContext& __restrict, uint8_t*);
@@ -125,7 +126,11 @@ REX_HOOK_RAW(sub_82353BA8) {
     }
     StoreGuestFloat(base, viewport + 116, aspect * factor);
   }
+  // The camera this view window goes to is the race's when the viewport is
+  // 16:9 (telemetry.cpp), told before the factor is applied.
+  xerenge::telemetry::EnterViewport(viewport, aspect);
   __imp__sub_82353BA8(ctx, base);
+  xerenge::telemetry::LeaveViewport();
   if (widen) {
     StoreGuestFloat(base, viewport + 112, scale);
     StoreGuestFloat(base, viewport + 116, aspect);
