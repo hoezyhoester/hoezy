@@ -51,6 +51,39 @@ if [ -n "$game" ]; then
     echo "== the manifest now points at $game"
 fi
 
+# What is generated from the game is kept between builds, and the code
+# generator does not clear out files it no longer writes. Build once from one
+# copy of the game (bootstrap.sh's own extraction, say) and again from another
+# (an installed copy on another drive), and generated/default holds both sets:
+# the functions are weak symbols, so the link goes through with a mix of the
+# two - an executable twice the size, and a title that misbehaves in odd places
+# (the main menu's background video drawn black). So the executable's checksum
+# is kept beside what was made from it, and a different one clears it all out
+# first.
+xex=$(sed -n 's/^file_path *= *"\(.*\)"/\1/p' "$project/burnout_manifest.toml" | head -1)
+if [ "$XR_OS" = windows ] && command -v cygpath >/dev/null; then
+    xex=$(cygpath -u "$xex")
+fi
+if [ ! -f "$xex" ]; then
+    echo "the manifest's executable is not there: $xex - run with --game <game directory>" >&2
+    exit 1
+fi
+if command -v sha256sum >/dev/null; then
+    xex_sum=$(sha256sum "$xex" | cut -d' ' -f1)
+else
+    xex_sum=$(shasum -a 256 "$xex" | cut -d' ' -f1)
+fi
+stamp="$project/generated/.source_xex_sha256"
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" != "$xex_sum" ]; then
+    echo "== the game is not the one the generated code came from: clearing it out"
+    rm -rf "$project/generated/default"
+    rm -f "$project/generated/shader_cache.cpp" \
+          "$project/generated/shader_cache_runtime.cpp" \
+          "$project/generated/shader_cache_runtime_raw.cpp"
+fi
+mkdir -p "$project/generated"
+printf '%s\n' "$xex_sum" > "$stamp"
+
 # The code generator turns the executable into C++ (generated/), and writes
 # the CMake glue the project's CMakeLists.txt includes - so it runs first.
 codegen=
